@@ -1,0 +1,672 @@
+---
+title: "HarvardX: PH125.9x"
+subtitle: "| \n|  _Data Science: Capstone - CYO_\n|  \n|  __Oral toxicity QSAR modeling__\n"
+author: "Franz Gruber"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: pdf_document
+indent: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(warnings = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(fig.align = 'center')
+
+```
+
+## Introduction
+
+
+Drug discovery is a lengthy, expensive and risky process^[https://www.nature.com/articles/nrd1468]. A typical _de novo_ drug discovery procedure can take between 10-17 years, with < 10 % chance of finding a successful drug^[https://www.nature.com/articles/nrd2593]. Early on in the drug discovery process, compounds (i.e. chemical moeities shown to modulate a biological process) need to be triaged out based on their toxicity as fast as possible (_"failing fast and cheap"_^[https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3058157]). Combining experimentally derived toxicological data of compounds with machine learning algorithms can help to make informed decisions, whether or not to include compounds in the downstream drug discovery pipeline.
+
+In this study, we have developed and tested models, which predict whether a compound is _toxic_ (_positive_) or non-toxic (_negative_) using __quantitative structure-activity relationship (QSAR)__ modeling. We used a dataset containing 8,992 compounds classified as either toxic or non-toxic based on experiments. For each compound a chemical fingerprint was generated, which encodes structural information in binary form. This leads to 1,024 features for each compound. We trained several machine learning classifiers: _k-NN_, _SVM_, _classification tree_, _random forrest_, _xgboost_ and _ensemble_ of models. We used `R`^[https://cran.r-project.org/] as our programming language and the `caret` package^[http://topepo.github.io/caret/] for model training and validation. We have reduced the 1,024 bit features (encoding structural information) of our dataset using dimensionality reduction. We have used the reduced features to train a _logistic regression_ model, which acted as a baseline to find the model with the best trade-off between _sensitivity_,  _specificity_ and $F_1$-score and then use the best two models to predict compound toxicity on a `validation` set, which simulates a dataset our model has not seen before.
+
+
+
+## Methods
+
+
+### Code availability
+
+This document only contains essential code bits. The full code is available in the accompanying `R script` file.
+
+### Dataset
+
+The dataset is provided on the _Machine Learning Repository_ website mainted by the University of Irvine^[https://archive.ics.uci.edu/ml/index.php] as a `zip` file and can be readily downloaded and extracted. The dataset was processed by Ballabio et al.^[https://onlinelibrary.wiley.com/doi/full/10.1002/minf.201800124] and contains information about whether compounds are very toxic (_positive_) or non-toxic (_negative_). Toxicity classification was based on experimental $LD_50$ values (i.e. the concentration of a compound to cause 50 % lethality in utilized animals^[https://onlinelibrary.wiley.com/doi/full/10.1002/minf.201800124]): _positive_ ($LD_{50}$ < 50 mg/kg), _negative_ ($LD_{50}$ >= 2,000 mg/kg). Furthermore, this dataset contains structural information about the compounds used in animal assays to determine $LD_{50}$ values. This information is represented as chemical fingerprints. A chemical fingerprint stores structural information in binary form (i.e. 1 if a structural feature is present, 0 if it is absent). Several algorithms are available to encode structures as fingerprints. A popular version are _extended-connectivity fingerprints_ _(ECFPs)_, which have been used in cheminformatics for similarity searching, compound clustering and virtual screening^[https://pubs.acs.org/doi/pdf/10.1021/ci100050t]. The fingerprints this dataset are stored as 1,024 bit fingerprints, which translate to 1,024 features for each compound.
+
+
+```{r setup-data, message=FALSE, include=FALSE}
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(knitr)) install.packages("knitr", repos = "http://cran.us.r-project.org")
+if(!require(kableExtra)) install.packages("kableExtra", repos = "http://cran.us.r-project.org")
+if(!require(gridExtra)) install.packages("gridExtra",repos = "http://cran.us.r-project.org")
+if(!require(Rtsne)) install.packages("Rtsne", repos = "http://cran.us.r-project.org")
+if(!require(kernlab)) install.packages("kernlab", repos = "http://cran.us.r-project.org")
+if(!require(C50)) install.packages("C50",repos = "http://cran.us.r-project.org")
+if(!require(ranger)) install.packages("ranger", repos = "http://cran.us.r-project.org")
+if(!require(xgboost)) install.packages("xgboost", repos = "http://cran.us.r-project.org")
+
+#limit number of decimal digits displayed
+options(digits = 4)
+
+
+#plotting theme
+theme_set(theme_bw())
+#personal preference
+theme_update(
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank()
+)
+
+#link to the oral toxicity dataset
+url <-"https://archive.ics.uci.edu/ml/machine-learning-databases/00508/qsar_oral_toxicity.zip"
+
+#generate temporay file and download data
+temp <- tempfile()
+download.file(url, temp)
+
+#check what files are in the zip
+unzip(temp, list = T)
+
+#extract file and read it in; transform datamode into factor
+input_df <- readr::read_delim(unzip(temp), delim = ';', col_names = c(paste0('Bit', seq(1,1024)), 'datamode')) 
+
+#remove temp file
+unlink(temp)
+```
+
+
+
+### Dataset cleaning, dimensionality reduction and data exploration
+
+The dataset contains `r dim(input_df)[1]` rows _(compounds)_ and `r dim(input_df)[2]` columns _(1,024 attributes, 1 datamode/class)_ . There are no missing values in our dataset:
+
+```{r echo=TRUE}
+
+input_df %>% is.na() %>% any()
+
+```
+
+Looking at the first 10 compounds and first 10 bits, we can see how the data looks like:  
+
+
+```{r inspect_data}
+
+input_df %>% 
+  dplyr::slice(1:10) %>% 
+  select(datamode, Bit1:Bit10) %>% 
+  knitr::kable() %>% 
+  kable_styling(latex_options = 'HOLD_position')
+  
+
+```
+
+We only see one positive compound and we see the occurence or absence of structural information encoded by the binary fingerprint. This can also be visualized: 
+
+
+```{r fingerprint_plot, message=FALSE, warning=FALSE, fig.height=3, fig.width=6}
+set.seed(1998, sample.kind = 'Rounding')
+input_df %>% 
+  sample_n(50) %>% 
+  select(datamode, Bit1:Bit100) %>% 
+  mutate(cpd_id = seq(1,50)) %>% 
+  gather(key, value, -cpd_id, -datamode) %>% 
+  ggplot(aes(key, cpd_id, fill = as.character(value))) +
+  geom_tile() +
+  geom_point(aes(x = -1, y = cpd_id, color = datamode), size = 0.3) +
+  labs(title = 'Oral toxicity data',
+       x = 'Fingerprint bit', y = 'Compound',
+       subtitle = 'black: Bit = 1 \t white: Bit=0') +
+  scale_x_discrete(expand = c(0.1,0)) +
+  scale_fill_manual(values = c('white', 'black')) +
+  scale_color_manual(name = 'Compound Toxic:', values = c('green', 'magenta')) +
+  guides(fill = FALSE) +
+  theme(
+    axis.ticks.x = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    panel.border = element_rect(color = 'white'),
+    plot.subtitle = element_text(face = 'italic'))
+
+
+```
+
+Our dataset is very imbalanced, as only about 8% of compounds have been assigned _positive_.
+
+
+```{r count_classes_plot, fig.width=3.5, fig.height=2}
+
+
+#count target classes and visualize
+input_df %>% 
+  count(datamode) %>% 
+  mutate(freq = n/sum(n) * 100,
+         freq_lab = paste0(round(freq, digits=0), '%')) %>% 
+  ggplot(aes(y = reorder(datamode, n), n)) +
+  geom_bar(stat = 'identity') +
+  geom_text(aes(label = freq_lab), hjust = -0.2, size = 3) +
+  labs(title = 'Class imbalance', x = 'Number of compounds', y = '') +
+  scale_x_continuous(breaks = seq(0,8000,2000), limits = c(0,9100)) +
+  theme(
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12)
+  )
+
+
+```
+
+
+We have seen that our dataest contains 1,024 attributes (or features). It is hard to visualize all of them to infer whether some features are more important than others. However, we can reduce the dimensionality of our dataset using _principle component analysis (PCA)_. This will help us to visualize the chemical space of our compounds by plotting the first two principle components:
+
+```{r pca_section, fig.width=4.5, fig.height=4.5}
+
+#perform pca for visualization
+pca <- prcomp(input_df %>% select(-datamode))
+
+#visual chemical space
+data.frame(pca$x[,1:2], datamode = input_df$datamode) %>% 
+  ggplot(aes(PC1, PC2, color = datamode)) +
+  geom_point(size = 1, alpha = 0.5) +
+  labs(title = 'Chemical Space of dataset') +
+  scale_color_manual(name = 'Compound toxic:', values = c('black', 'magenta'))+
+  theme(legend.position = 'top')
+
+```
+
+
+We can look at the amount of variance explained by the principle components (left figure panel) and observe that the first 50 principle components add up to about 55% variance explained (dashed line, right figure panel). We will use this information to guide our next approach.
+
+
+```{r variance_exp_plot, fig.width=8, fig.height=2.5}
+
+
+#calculate percentage variance explained
+p1 <- data.frame(variance_explained = pca$sdev^2/sum(pca$sdev^2)*100,
+           pc = seq(1, length(pca$sdev))) %>% 
+  filter(pc <=50) %>% 
+  ggplot(aes(pc, variance_explained)) +
+  geom_bar(stat = 'identity') +
+  labs(x = 'Principle Components',
+       y = '% variance explained')
+
+#plot cumulative sum of percentage variance explained
+p2 <- data.frame(variance_explained = pca$sdev^2/sum(pca$sdev^2)*100,
+           pc = seq(1, length(pca$sdev))) %>% 
+  filter(pc <=50) %>% 
+  ggplot(aes(pc, cumsum(variance_explained))) +
+  geom_bar(stat = 'identity') +
+  geom_hline(yintercept = 55, linetype = 'dashed', color = 'grey') +
+  scale_y_continuous(breaks = seq(0,60, 10), limits = c(0,60)) +
+  labs(x = 'Principle Components', 
+       y = 'Cumulative sum')
+
+#plot both graphs using gridExtra
+grid.arrange(p1, p2, ncol = 2)
+
+```
+
+Another dimensionality reduction algorithm called _t_-stochastic neighbor embedding _(t-SNE)_ can improve visualization of high dimensional data, as it might reveal underlying clusters of similar data points^[http://www.jmlr.org/papers/volume9/vandermaaten08a/vandermaaten08a.pdf]. We will use the `Rtsne` function of the `Rtsne` package to perform _t_-SNE setting the number of dimensions to reduce to `dims` = 3. In addition the `Rtsne` function allows to perform PCA in order to improve computational performance. We will use 50 principle components setting `initial_dims = 50`. 
+
+
+
+```{r t-sne_plot, fig.width=4.5, fig.height=4.5, message=FALSE, warning=FALSE}
+
+#perform tsne for visualization
+set.seed(1985, sample.kind = 'Rounding')
+tsne <- Rtsne(input_df %>% select(-datamode), 
+              dims = 3, 
+              initial_dims = 50, 
+              pca_center = F, 
+              check_duplicates = FALSE)
+
+data.frame(tsne1 = tsne$Y[,1], tsne2 = tsne$Y[,2], datamode = input_df$datamode) %>% 
+  ggplot(aes(tsne1, tsne2, color = datamode)) +
+  geom_point(size = 1, alpha = 0.5) +
+  scale_color_manual(name = 'Toxic compound:', values = c('black', 'magenta')) +
+  labs(title = expression(~italic(t)~'-SNE visualization of chemical space'),
+       x = 't-SNE1', y = 't-SNE2') +
+  theme(
+    legend.position = 'top'
+  )
+
+```
+
+### Insights gained
+
+In our data exploration section we have seen that our dataset of 8,992 compounds contains 1,024 attributes (encoded as a chemical fingerprint). The dataset is imbalanced (only few occurances of the _positive_ class). We have used dimensionality reduction algorithms (PCA and _t_-SNE) to visualize chemical space. We saw that both classes _(positive and negative)_ overlap in both plots, showing that the dataset represent toxic and non-toxic compounds throughout the chemical space within our dataset. The _t_-SNE plot revealed that our dataset contains small clusters of compounds which share similarity.
+
+
+### Modeling approach
+
+For building our QSAR classification model we will use three _t_-SNE dimensions. This will reduce the time it takes to train our models. We will split our dataset into a `model` (80%) and `validation` set (20%) using the `createDataPartition` function of the `caret` package. We will use the validation set only at the very end for model validation. 
+
+Furthermore, we will split our `model` dataset into a `train` (80%) and `test` set (20%). We will use those two datasets for model building and optimization.
+
+
+```{r dataset_splitting, message=FALSE, warning=FALSE}
+
+#take only 3 tSNE dimenions for further analysis
+new_df <- data.frame(
+  tsne$Y
+) %>% mutate( y = input_df$datamode %>% factor())
+
+
+#generate a validation set
+set.seed(1998, sample.kind = 'Rounding')
+
+train_index <- createDataPartition(new_df$y, times = 1, p = 0.8, list = FALSE)
+
+#this dataset will be split into training and test set for model evaluation
+model_df <- new_df[train_index,]
+
+#this is the hold out set for validating our model
+validation_df <- new_df[-train_index,]
+
+
+#split model dataset into train and test set
+set.seed(1999, sample.kind = 'Rounding')
+train_ind <- createDataPartition(model_df$y, times = 1, p = 0.8, list = FALSE)
+
+train_set <- model_df[train_ind,]
+test_set <- model_df[-train_ind,]
+
+```
+For model training we will use the default _bootstrap_ method of the `caret` package. Furthermore, due to the imbalance of classes, we will use downsampling (i.e. have an equal amount of _positive and negative_ classes during model training), which can be specified in the `trainControl(sampling = 'down')` function of the `caret` package. 
+
+Our aim is to compare several models, which outperform a logistic regression model, and pick the one with the best performance. 
+
+We will briefly explain all modeling algorithms used in the following sections.
+
+#### Logistic Regression
+
+We will use _Logistic Regression_ as a baseline model for classifying compounds. We will use `method = 'glm'` function and `family = 'binomial'` within the `train()` function of `caret` to perform logistic regression. 
+
+
+#### k-NN model
+
+The __k-Nearest Neighbors__ algorithm first calculates distances between observations, using the features of all observations. Typical distance metrics used with the __k-NN__ algorithm are _euclidean or cosine_ distance. In the second step the alogrithm determines a class label for an observation based on most abundant class in close proximity. This algorithm requires a predefined __k__ (i.e. number of neighbors) to be set, which can be determined during model training. In this study, we will use the `knn` function of the `caret` package.
+
+
+
+#### SVM model
+
+A __support vector machine__ model tries to find a boundary (i.e. _hyperplane_) between observations in multidimensional space, which can be used for classifcation^[Brett Lantz: Machine Learning with R, second edition]. We will use the `svmRadial` (radial kernel) function of the `kernlab` package^[https://cran.r-project.org/web/packages/kernlab/index.html]. 
+
+
+#### C5.0 model
+
+The __C5.0__ algorithm is an implementation of decision trees^[Brett Lantz: Machine Learning with R, second edition]. This algortihm uses features to split the data into classes. Descissions on how well a partition based on a feature was can be made on metrices like _Gini Index_ or _Entropy_^[Rafael A. Irizarry: Introduction to Data Science]. An advantage of decision trees is that they can be interpreted more readily than other machine learning algorithms and one can visualize them. We will use the `C5.0` function of the `C50` package^[https://cran.r-project.org/web/packages/C50].
+
+
+
+#### random forrest model
+
+The __random forrest__ algorithm tries to overcome short comings of a decision tree (changes in training data makes them unstable^[Rafael A. Irizarry: Introduction to Data Science]), by building multiple decision trees (i.e. _forrest_) and take the average of those trees^[Rafael A. Irizarry: Introduction to Data Science].
+We will use the `ranger` package^[https://cran.r-project.org/web/packages/ranger] to train a __random forrest__ model.
+
+
+#### xgboost model
+
+__Xgboost__ stands for e __X__ treme __G__ radient __B__ oosting^[https://xgboost.readthedocs.io/en/latest/R-package/xgboostPresentation.html]. It is a very popular machine learning algorithm related to _random forrests_ and has won several competitions on _Kaggle_^[https://xgboost.readthedocs.io/en/latest/R-package/xgboostPresentation.html]. Xgboost contains additional hyperparameters (e.g. regularization) to prevent overfitting^[Bradley Boehmke, Brandon Greenwell: Hands-On Machine Learning with R].
+
+
+#### Model ensemble
+
+Our final model will be an _ensemble_ of models. We will use the predictions of all explained models and use _majority vote_ to classify our compounds.
+
+
+### Model performance
+
+The aim of this study is to predict, whether a compound is toxic _("positive")_ or non-toxic _("negative")_. We will consider a _false negative (FN)_ prediction (i.e. compound was classified as non-toxic, but in reality is toxic) to be more harmful then a _false positive (FP)_ prediction (i.e. compound was classified as toxic, but in reality is non-toxic). Therefore, we want a model, with a low amount of _FN_ classifications. 
+
+During our model optimization we will calculate _Sensitivity (true positive rate, TPR or recall)_ as:
+
+$$recall = TP/(TP+FN)$$
+where $TP$ are true positive predictions and $FN$ are fals negative predictions. The $TPR$ is the proportion of actual positives predicted as positive^[Rafael A. Irizarry: Introduction to Data Science].
+
+We will also calculate _Specificity (PPV or precision)_ as:
+
+$$precision = TP/(TP+FP)$$
+where $TP$ are true positive predictions and $FP$ are false positive predictions. The $PPV$ is the proportion of actual positives predicted as positives^[Rafael A. Irizarry: Introduction to Data Science].
+
+We will also calculate the $F_1$-score, defined as:
+$$ F_1 = 2 \times \frac{precision \cdot recall}{precision + recall} $$
+where $F_1$ is the harmonic average between $TPR$ _(recall)_ and $PPV$ _(precision)_.
+
+Furthermore, we will look at model accuracy (also called _success rate_^[Brett Lantz: Machine Learning with R, second edition]) defined as:
+$$ Accuracy = \frac{TP + TN}{TP+TN+FP+FN}$$
+
+
+
+## Results
+
+
+In this section we will look at the performance of several trained models and compare them. We will use all the three _t_-SNE features received after dimensionality reduction for training our model. Once we have decided on two good performing models, we will use our `validation` set (hold-out data) to see how our model performs on data it has not seen before. We will start our modeling approach with _logistic regression_. To see the effect of an imbalanced dataset on model training, we will train two models: one with the full training set and one where the dataset gets downsampled (i.e. having the same amount of _negative_ and _positive_ samples) during training. The following table summarizes the performance of the _logistic regression_ models:
+
+```{r results_glm, message=FALSE, warning=FALSE}
+
+#ensure downsampling
+train_control <- trainControl(sampling = 'down')
+
+#set.seed everytime before training a model to ensure reproducibility
+set.seed(1999, sample.kind = 'Rounding')
+
+#train logistic model with all data
+fit_glm <- train(y ~ ., data = train_set,
+                 method = 'glm',
+                 family = 'binomial') 
+
+
+#train logistic model using downsampling
+set.seed(1999, sample.kind = 'Rounding')
+fit_glm_ds <- train(y ~ ., data = train_set,
+                 method = 'glm',
+                 family = 'binomial',
+                 trControl = train_control)
+
+#predict compound toxicity
+y_hat_glm <- predict(fit_glm, test_set)
+y_hat_glm_ds <- predict(fit_glm_ds, test_set)
+
+
+
+#performance data frame
+perf_df <- tibble(
+  Model = 'Logistic Regression all data',
+  Accuracy = confusionMatrix(y_hat_glm, test_set$y, positive = 'positive')$overall['Accuracy'],
+  Sensitivity = sensitivity(y_hat_glm, test_set$y, positive = 'positive'),
+  Specificity = confusionMatrix(y_hat_glm, test_set$y, positive = 'positive')$byClass['Precision'],
+  F1 = F_meas(y_hat_glm, test_set$y, relevant = 'positive')
+)
+
+
+#wrapper function to add performance metrics
+add_perf <- function(df, model, predictions, true_value) {
+  
+  df <- df %>% 
+    rbind(tibble(
+      Model = model,
+      Accuracy = confusionMatrix(predictions, true_value, positive = 'positive')$overall['Accuracy'],
+      Sensitivity = sensitivity(predictions, true_value, positive = 'positive'),
+      Specificity = confusionMatrix(predictions, true_value, positive = 'positive')$byClass['Precision'],
+      F1 = F_meas(predictions, true_value, relevant = 'positive')
+      
+    ))
+  
+}
+
+perf_df <- add_perf(perf_df, 'Logistic Regression downsampling', y_hat_glm_ds, test_set$y)
+
+perf_df %>% knitr::kable() %>% 
+  kable_styling(latex_options = 'HOLD_position')
+
+
+```
+We can see that our _logistic regression_ model using all data points achieves an accuracy of `r confusionMatrix(y_hat_glm, test_set$y, positive = 'positive')$overall['Accuracy']`, which is quite impressive, however its sensitivity is `r sensitivity(y_hat_glm, test_set$y, positive = 'positive')`. The downsampled has a much smaller accuracy but gains in _Sensitivity_ and _Specificity_.
+
+Looking closer at the confusion matrix, we can see what happend with the model that did not use downsampling:
+
+```{r glm_confusionMatrix}
+
+confusionMatrix(y_hat_glm, test_set$y, positive = 'positive')$table %>% 
+  kable() %>% 
+  kable_styling(latex_options = 'HOLD_position')
+
+```
+We have trained a model, which learned to predict mainly _negatives_ (non-toxic) but fails to predict _positives_ (toxic). This shows that _accuracy_ is not a good performance metric if the dataset is imbalanced. Therefore, we will focus on _sensitivity, specificity_ and $F_1$-score. In addition we will use downsampling, which gives a  better picture of model performance. One of our main aims is to avoid predicting _false negatives_. 
+
+
+The next model we will test is _k-NN_. We can see that _sensitivity_ is slightly higher than the with the _logistic regression_ model, and in addition we also increase _specificity_ and therfore also the $F_1$-score.
+
+```{r kNN_model, message=FALSE, warning=FALSE}
+
+#set seed and train model
+set.seed(1999, sample.kind = "Rounding")
+fit_knn <- train(y ~ ., data = train_set,
+                method = 'knn',
+                trControl = train_control)
+
+#predict values
+y_hat_knn <- predict(fit_knn, test_set)
+
+#add values to performance table
+perf_df <- add_perf(perf_df, 'k-NN', y_hat_knn, test_set$y)
+perf_df %>% knitr::kable() %>% 
+  kable_styling(latex_options = 'HOLD_position')
+
+
+```
+During model training the `caret` package automatically optimized the hyperparameter _k_ (close neighbors):
+
+```{r besttune_knn, echo = T, message=FALSE, warning=FALSE}
+
+fit_knn$bestTune
+
+```
+
+Our next model to try out will be a _support vector machine (SVM)_ model. We see that this model, has slighlty lower _sensitivity_ but slightly better _specificity_, which leads to an overall higher $F_1$-score.
+
+```{r svm_model, message=FALSE, warning=FALSE}
+
+#set seed and train svm model
+set.seed(1999, sample.kind = 'Rounding')
+fit_svm <- train(y ~ ., data = train_set,
+                 method = 'svmRadial',
+                 trControl = train_control)
+
+#predict compounds
+y_hat_svm <- predict(fit_svm, test_set)
+
+
+#add metrics to performance data frame
+perf_df <- add_perf(perf_df, 'SVM', y_hat_svm, test_set$y)
+perf_df %>% knitr::kable() %>% 
+  kable_styling(latex_options = 'HOLD_position')
+
+```
+We can also see that `caret` found the best _SVM_ model using the following hyperparameters for _sigma_ (inverse kernel width) and _C_ (cost of constraints):
+
+```{r svm_hyperparameters,echo = TRUE, message=FALSE, warning=FALSE}
+
+fit_svm$bestTune
+
+```
+
+Next, we will use a _classification tree_ model. Like the _SVM_ model, the _C5.0 tree_ model has slightly lower _sensitivity_ but again achieves better _specificity_ and therefore $F_1$-score. 
+
+```{r class_tree, message=FALSE, warning=FALSE}
+#set seed and train model
+set.seed(1999, sample.kind = 'Rounding')
+fit_c5 <- train(y ~ ., data = train_set,
+                method = 'C5.0',
+                trControl = train_control)
+#predict compounds
+y_hat_c5 <- predict(fit_c5, test_set)
+
+#add performance metrics to data frame
+perf_df <- add_perf(perf_df, 'C5.0 tree', y_hat_c5, test_set$y)
+perf_df %>% knitr::kable() %>% 
+  kable_styling(latex_options = 'HOLD_position')
+
+```
+The optimal hyperparameters for this model are chosen by `caret` with _trials_ (number of boosting iterations), _model_ (tree or rule-based model), _winnow_ (feature winnowing/selection):
+
+```{r c5_hyperparmeter, echo = TRUE, message=FALSE, warning=FALSE}
+
+fit_c5$bestTune
+
+```
+
+Can we improve this by using multiple _classification trees_ using a _random forrest_ model? Our _random forrest_ model not only outperformed the _C5.0 tree_ but has so far the highest _sensitivity_, although _specificity_ is slightly lower than for the _C5.0 tree_ model. 
+
+```{r rf_model, message=FALSE, warning=FALSE}
+#set seed and train model
+set.seed(1999, sample.kind = 'Rounding')
+capture.output(
+fit_rf <- train(y ~ ., data = train_set,
+                method = 'ranger',
+                trControl = train_control), file = 'NUL')
+
+#predict compound toxicity
+y_hat_rf <- predict(fit_rf, test_set)
+
+#add performance metrics to df
+perf_df <- add_perf(perf_df, 'random forrest', y_hat_rf, test_set$y)
+perf_df %>% knitr::kable() %>% 
+  kable_styling(latex_options = 'HOLD_position')
+
+```
+We see that `caret` has optimized `mtry` (number of variables to split), `splitrule` (splitting rule) and `min.node.size` (minimal node size) hyperparameters as follows:
+
+```{r rf_hyperparameters, echo = TRUE, message=FALSE, warning=FALSE}
+
+fit_rf$bestTune
+
+```
+We will now use model type similar to _random forrest_ model called `xbgtree`. We see that this model does have similar _sensitivity_ and _specificity_ performance as the _random forrest_ model, however slightly worse.
+
+```{r, xgb_tree, message=FALSE, warning=FALSE}
+#set seed and fit model
+set.seed(1999, sample.kind = 'Rounding')
+fit_xgbtree <- train(y ~ ., data = train_set,
+                     method = 'xgbTree',
+                     trControl = train_control)
+
+#predict compound toxicity
+y_hat_xgbtree <- predict(fit_xgbtree, test_set)
+
+#add metrics to performance data frame
+perf_df <- add_perf(perf_df, 'xgb Tree', y_hat_xgbtree, test_set$y)
+perf_df %>% knitr::kable() %>% 
+  kable_styling(latex_options = 'HOLD_position')
+
+```
+
+The `train` function of the `caret` package has optimized the following hyperparameters: _nrounds_ (number of rounds), _max_depth_ (depth of tree), _eta_ (tree scaling factor), _gamma_ (regularization term), _colsample_bytree_ (subsample ratio of columns), _min_child_weight_ (minimum sum of instance weight) and _subsample_ (subsample ratio of training instance).
+
+```{r xgb_besttune, echo = TRUE, message=FALSE, warning=FALSE}
+
+fit_xgbtree$bestTune
+
+```
+
+Our final model will combine all predictions in an _ensemble_. We will use _majority_ vote over all models. We can see that our _ensemble_ ranks lower in _sensitivity_ but has the best $F_1$-score of all models.
+
+```{r ensemble, message=FALSE, warning=FALSE}
+
+
+#create prediction matrix with all model predictions
+pred_mat <- tibble(
+  
+  k_nn = y_hat_knn,
+  svm = y_hat_svm,
+  rf = y_hat_rf,
+  c5 = y_hat_c5,
+  xgb = y_hat_xgbtree
+  
+) %>% as.matrix()
+
+
+#perform majority vote to predict positive
+y_hat_ensemble <- ifelse(rowMeans(pred_mat == 'positive') > 0.5, 'positive', 'negative') %>% factor(levels = levels(test_set$y))
+
+
+perf_df <- add_perf(perf_df, 'ensemble', y_hat_ensemble, test_set$y)
+perf_df %>% knitr::kable() %>% 
+  kable_styling(latex_options = 'HOLD_position')
+
+
+```
+
+
+Now that we have tried out several machine learning models, we will validate two of them using our `validation` set (or hold-out set). We will compare the model with the highest _sensitivity (random forrest)_ to the model with the highest $F_1$-score _(ensemble of models)_. 
+
+
+We will train the _random forrest_ on the `model` dataset and the validate it with the `validation` set. We see that the _random forrest_ model has a similar performance of _sensitivity, specificity_ and $F_1$-score on the `valdiation` set. 
+
+```{r model_validation, message=FALSE, warning=FALSE}
+
+#set seed and train model
+set.seed(1999, sample.kind = 'Rounding')
+capture.output(
+fit_rf_val <- train(y ~ ., data = model_df,
+                    method = 'ranger',
+                    trControl = train_control), file = 'NUL')
+
+#predict compounds of validation set
+y_hat_rf_val <- predict(fit_rf_val, validation_df)
+
+#add performance metrics
+perf_df <- add_perf(perf_df, 'random forrest validation', y_hat_rf_val, validation_df$y)
+perf_df %>% knitr::kable() %>% 
+  kable_styling(latex_options = 'HOLD_position')
+
+
+```
+
+How will the _ensemble_ of models perform? We will train our five models again on the `model` dataset and then predict compound toxicity using the `validation` dataset:
+
+```{r ensemble_validation, echo=TRUE, message=FALSE, warning=FALSE}
+
+
+#vector with model names
+models <- c('knn', 'svmRadial', 'C5.0', 'ranger', 'xgbTree')
+
+#train control for downsampling
+train_control <- trainControl(sampling = 'down')
+
+#train models
+capture.output(
+ensemble <- lapply(models, function(model){
+  
+  set.seed(1999, sample.kind = 'Rounding')
+  fit_ens <- train(y ~ ., data = model_df,
+                   method = model,
+                   trControl = train_control)
+  
+}), file = 'NUL')
+#generate matrix with model predictions
+pred_mat_val <- sapply(ensemble, function(x){
+  
+  predict(x, validation_df)
+  
+})
+
+#predict compound toxicity using majority vote
+y_hat_ensemble_val <- ifelse(rowMeans(pred_mat_val == 'positive') > 0.5, 'positive', 'negative') %>% 
+  factor(levels(validation_df$y)) 
+
+```
+
+We can see that the _ensemble_ model also performs similar on the `validation` dataset. 
+
+```{r validation_kable}
+
+perf_df <- add_perf(perf_df, 'ensemble validation', y_hat_ensemble_val, validation_df$y)
+perf_df %>% knitr::kable() %>% 
+  kable_styling(latex_options = 'HOLD_position')
+
+
+
+```
+
+Overall, the _random forrest_ model has had the best _sensitivity_.
+
+## Discussion
+
+
+Machine learning is indispensable in modern drug discovery. Machine learning models can help making decisions on whether to follow-up on compounds, which have been shown to have an effect on a biological process. One important step early in the drug discovery process is to ensure a compound is specific and does not have any toxic side effects.
+
+_QSAR_ modeling of compound toxicity can help to make follow-up decisions based on predictions using experimental data as modeling inputs. Such models can then be used to predict whether a compound is toxic or not, based on e.g. its chemical structure (encoded as a chemical fingerprints).
+
+We started with our dataset of 8,992 classified compounds by reducing the 1024 features to three _t_-SNE dimensions. For the modeling process, we have used all three reduced feature columns. We saw that our dataset is highly imbalanced (more _negatives_ than _positives_). Therefore, we used _downsampling_ during the modeling process. We have tested five models _(k-NN, SVM, classification tree, random forrest, xgboost)_ and performed predictions in an _ensemble_ of models using majority vote. We saw that the _random forrest_ model performed best (highest _sensitivity_ and high $F_1$-score). We consider _sensitivity_ more important, as we want to avoid _false negative_ predictions (compound is predicted non-toxic, but in reality is toxic) at the expense of decreasing _specificity_ (compound is predicted toxic, but is not-toxic). Our _random forrest_ model had similar performance on the `validation` (hold-out) set. The model could be improved iteratively by testing predicted compounds in toxicological assays (experiments) and feed this information back to the model to improve it.
+
+The dataset had some limitations. It did not contain any compound identifier, so all information we had were the 1024 fingerprint bits encoding structural information (it is not possible to decode a fingerprint into its original chemical structure). Would the dataset contain a compound identifier such as ChEMBL or Pubchem ID, or structural annotation such as SMILES or InChIKey one could perform web scraping to blend in additional compound data, calculate further properties of a compound (e.g. physico-chemical properties), or generate fingerprints with more information (e.g. 2048 bit). Any additional compound properties could be used as additional input features for the modeling process.
+
+What would be the next steps? We could try reducing our dataset to more dimension and compare how a _random forrest_ model would perform. In addtion other dimensionality reduction techniques such as UMAP could be tried out. During the modeling process we only used _downsampling_ to ensure equal classes. There are other algorithms not explored here e.g. _upsampling_ or _SMOTE_, which could be explored in more detail. Furthermore, we could perform a more in-depth hyperparameter tuning, when training a model. Our _random forrest_ model was optimized to use only 2 feature columns (`mtry = 2`). It would be interesting to see how we could improve the model using a broader set of hyperparameters in a tuning grid. There is much room to improve our models. E.g. one could introduce cost-sensitive learning, which would penalize certain outcomes more than others. The `C50` package offers options to do so, which have not been explored here. To our surprise the `xgboost` model, which is a very popular model did not perform as good as the _random forrest_ model. Again, a more in-depth hyperparameter tuning might lead to better performance. Finally, we could enrich our _ensemble_ of models by adding predictions of additional models.
+
+
